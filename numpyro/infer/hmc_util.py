@@ -29,7 +29,7 @@ HMCAdaptState = namedtuple(
     ],
 )
 IntegratorState = namedtuple(
-    "IntegratorState", ["z", "r", "potential_energy", "z_grad"]
+    "IntegratorState", ["z", "r", "potential_energy", "kinetic_energy", "z_grad"]
 )
 IntegratorState.__new__.__defaults__ = (None,) * len(IntegratorState._fields)
 
@@ -39,11 +39,14 @@ TreeInfo = namedtuple(
         "z_left",
         "r_left",
         "z_left_grad",
+        "z_left_ke",
         "z_right",
         "r_right",
         "z_right_grad",
+        "z_right_ke",
         "z_proposal",
         "z_proposal_pe",
+        "z_proposal_ke",
         "z_proposal_grad",
         "z_proposal_energy",
         "depth",
@@ -55,6 +58,10 @@ TreeInfo = namedtuple(
         "num_proposals",
     ],
 )
+
+
+
+
 
 
 def dual_averaging(t0=10, kappa=0.75, gamma=0.05):
@@ -253,7 +260,7 @@ def _kinetic_grad(kinetic_fn, inverse_mass_matrix, r):
         return grad(kinetic_fn, argnums=1)(inverse_mass_matrix, r)
 
 
-def velocity_verlet(potential_fn, kinetic_fn, forward_mode_differentiation=False):
+def velocity_verlet(potential_fn, kinetic_fn, mchmc, forward_mode_differentiation=False):
     r"""
     Second order symplectic integrator that uses the velocity verlet algorithm
     for position `z` and momentum `r`.
@@ -263,9 +270,11 @@ def velocity_verlet(potential_fn, kinetic_fn, forward_mode_differentiation=False
         any python collection type.
     :param kinetic_fn: Python callable that returns the kinetic energy given
         inverse mass matrix and momentum.
+    :param mchmc: if True runs MCHMC instead of HMC
     :return: a pair of (`init_fn`, `update_fn`).
     """
-
+    
+    
     def init_fn(z, r, potential_energy=None, z_grad=None):
         """
         :param z: Position of the particle.
@@ -278,7 +287,8 @@ def velocity_verlet(potential_fn, kinetic_fn, forward_mode_differentiation=False
             potential_energy, z_grad = _value_and_grad(
                 potential_fn, z, forward_mode_differentiation
             )
-        return IntegratorState(z, r, potential_energy, z_grad)
+        return IntegratorState(z, r, potential_energy, 0.5 * jnp.sum(jnp.square(ravel_pytree(r)[0])) *(1-mchmc), z_grad)
+
 
     def update_fn(step_size, inverse_mass_matrix, state):
         """
@@ -288,7 +298,7 @@ def velocity_verlet(potential_fn, kinetic_fn, forward_mode_differentiation=False
         :param state: Current state of the integrator.
         :return: new state for the integrator.
         """
-        z, r, _, z_grad = state
+        z, r, _, _, z_grad = state
         r = tree_map(
             lambda r, z_grad: r - 0.5 * step_size * z_grad, r, z_grad
         )  # r(n+1/2)
@@ -300,9 +310,67 @@ def velocity_verlet(potential_fn, kinetic_fn, forward_mode_differentiation=False
         r = tree_map(
             lambda r, z_grad: r - 0.5 * step_size * z_grad, r, z_grad
         )  # r(n+1)
-        return IntegratorState(z, r, potential_energy, z_grad)
+        return IntegratorState(z, r, potential_energy, kinetic_fn(inverse_mass_matrix, r), z_grad)
 
-    return init_fn, update_fn
+
+    def momentum_update(step_size, r, z_grad):
+        """r is the (unit) velocity, z_grad= - grad_z log p(z)"""
+        
+        # convert to vectors to compute the dot products
+        u = ravel_pytree(r)[0]
+        g = ravel_pytree(z_grad)[0]
+        
+        g_norm = jnp.sqrt(jnp.sum(jnp.square(g)))
+        ue = -jnp.dot(u, g)/g_norm
+        d = jnp.size(u)
+        
+        # these are all scalars:
+        delta = step_size * g_norm / (d-1)
+        zeta = jnp.exp(-delta)
+        kinetic = delta - jnp.log(2) + jnp.log(1 + ue + (1-ue)*zeta**2)
+        
+        b = -(1-zeta)*(1+zeta + ue * (1-zeta)) / g_norm
+        a = 2*zeta
+        
+        # normalize the new velocity
+        u = a * u + b * g 
+        u_norm = jnp.sqrt(jnp.dot(u, u))
+        a /= u_norm
+        b /= u_norm
+        
+        # linear combination of pytrees:
+        r_new = tree_map(lambda r, z_grad: a * r + b * z_grad, r, z_grad)
+        
+        return r_new, (d-1) * kinetic
+
+
+    def update_fn_mchmc(step_size, inverse_mass_matrix, state):
+        """
+        :param float step_size: Size of a single step.
+        :param inverse_mass_matrix: Inverse of mass matrix, which is used to
+            calculate kinetic energy.
+        :param state: Current state of the integrator.
+        :return: new state for the integrator.
+        """
+        z, r, _, kinetic, z_grad = state
+        
+        # half step in momentum
+        r, dk1 = momentum_update(step_size * 0.5, r, z_grad)
+        
+        # full step in position
+        r_grad = _kinetic_grad(kinetic_fn, inverse_mass_matrix, r)
+        z = tree_map(lambda z, r_grad: z + step_size * r_grad, z, r_grad)
+        potential_energy, z_grad = _value_and_grad(
+            potential_fn, z, forward_mode_differentiation
+        )
+        #half step in momentum
+        r, dk2 = momentum_update(step_size * 0.5, r, z_grad)
+        
+        return IntegratorState(z, r, potential_energy, kinetic+dk1+dk2, z_grad)
+    
+    
+    return init_fn, update_fn_mchmc if mchmc else update_fn
+
 
 
 def find_reasonable_step_size(
@@ -763,25 +831,29 @@ def _combine_tree(
 ):
     # Now we combine the current tree and the new tree. Note that outside
     # leaves of the combined tree are determined by the direction.
-    z_left, r_left, z_left_grad, z_right, r_right, r_right_grad = cond(
+    z_left, r_left, z_left_grad, z_left_ke, z_right, r_right, r_right_grad, z_right_ke = cond(
         going_right,
         (current_tree, new_tree),
         lambda trees: (
             trees[0].z_left,
             trees[0].r_left,
             trees[0].z_left_grad,
+            trees[0].z_left_ke,
             trees[1].z_right,
             trees[1].r_right,
             trees[1].z_right_grad,
+            trees[1].z_right_ke,
         ),
         (new_tree, current_tree),
         lambda trees: (
             trees[0].z_left,
             trees[0].r_left,
             trees[0].z_left_grad,
+            trees[0].z_left_ke,
             trees[1].z_right,
             trees[1].r_right,
             trees[1].z_right_grad,
+            trees[1].z_right_ke,
         ),
     )
     r_sum = tree_map(jnp.add, current_tree.r_sum, new_tree.r_sum)
@@ -796,12 +868,13 @@ def _combine_tree(
         turning = current_tree.turning
 
     transition = random.bernoulli(rng_key, transition_prob)
-    z_proposal, z_proposal_pe, z_proposal_grad, z_proposal_energy = cond(
+    z_proposal, z_proposal_pe, z_proposal_ke, z_proposal_grad, z_proposal_energy = cond(
         transition,
         new_tree,
         lambda tree: (
             tree.z_proposal,
             tree.z_proposal_pe,
+            tree.z_proposal_ke,
             tree.z_proposal_grad,
             tree.z_proposal_energy,
         ),
@@ -809,6 +882,7 @@ def _combine_tree(
         lambda tree: (
             tree.z_proposal,
             tree.z_proposal_pe,
+            tree.z_proposal_ke,
             tree.z_proposal_grad,
             tree.z_proposal_energy,
         ),
@@ -825,11 +899,14 @@ def _combine_tree(
         z_left,
         r_left,
         z_left_grad,
+        z_left_ke,
         z_right,
         r_right,
         r_right_grad,
+        z_right_ke,
         z_proposal,
         z_proposal_pe,
+        z_proposal_ke,
         z_proposal_grad,
         z_proposal_energy,
         tree_depth,
@@ -848,6 +925,7 @@ def _build_basetree(
     z,
     r,
     z_grad,
+    kinetic,
     inverse_mass_matrix,
     step_size,
     going_right,
@@ -855,11 +933,11 @@ def _build_basetree(
     max_delta_energy,
 ):
     step_size = jnp.where(going_right, step_size, -step_size)
-    z_new, r_new, potential_energy_new, z_new_grad = vv_update(
-        step_size, inverse_mass_matrix, (z, r, energy_current, z_grad)
+    z_new, r_new, potential_energy_new, kinetic_energy_new, z_new_grad = vv_update(
+        step_size, inverse_mass_matrix, (z, r, energy_current, kinetic, z_grad)
     )
 
-    energy_new = potential_energy_new + kinetic_fn(inverse_mass_matrix, r_new)
+    energy_new = potential_energy_new + kinetic_energy_new
     delta_energy = energy_new - energy_current
     # Handles the NaN case.
     delta_energy = jnp.where(jnp.isnan(delta_energy), jnp.inf, delta_energy)
@@ -871,11 +949,14 @@ def _build_basetree(
         z_new,
         r_new,
         z_new_grad,
+        kinetic_energy_new,
         z_new,
         r_new,
         z_new_grad,
+        kinetic_energy_new,
         z_new,
         potential_energy_new,
+        kinetic_energy_new,
         z_new_grad,
         energy_new,
         depth=0,
@@ -892,9 +973,9 @@ def _get_leaf(tree, going_right):
     return cond(
         going_right,
         tree,
-        lambda tree: (tree.z_right, tree.r_right, tree.z_right_grad),
+        lambda tree: (tree.z_right, tree.r_right, tree.z_right_grad, tree.z_right_ke),
         tree,
-        lambda tree: (tree.z_left, tree.r_left, tree.z_left_grad),
+        lambda tree: (tree.z_left, tree.r_left, tree.z_left_grad, tree.z_left_ke),
     )
 
 
@@ -1002,13 +1083,14 @@ def _iterative_build_subtree(
         current_tree, _, r_ckpts, r_sum_ckpts, rng_key = state
         rng_key, transition_rng_key = random.split(rng_key)
         # If we are going to the right, start from the right leaf of the current tree.
-        z, r, z_grad = _get_leaf(current_tree, going_right)
+        z, r, z_grad, kinetic = _get_leaf(current_tree, going_right)
         new_leaf = _build_basetree(
             vv_update,
             kinetic_fn,
             z,
             r,
             z_grad,
+            kinetic,
             inverse_mass_matrix,
             step_size,
             going_right,
@@ -1066,11 +1148,14 @@ def _iterative_build_subtree(
         tree.z_left,
         tree.r_left,
         tree.z_left_grad,
+        tree.z_left_ke,
         tree.z_right,
         tree.r_right,
         tree.z_right_grad,
+        tree.z_right_ke,
         tree.z_proposal,
         tree.z_proposal_pe,
+        tree.z_proposal_ke,
         tree.z_proposal_grad,
         tree.z_proposal_energy,
         prototype_tree.depth,
@@ -1124,8 +1209,8 @@ def build_tree(
         max_tree_depth_current, max_tree_depth = max_tree_depth
     else:
         max_tree_depth_current = max_tree_depth
-    z, r, potential_energy, z_grad = verlet_state
-    energy_current = potential_energy + kinetic_fn(inverse_mass_matrix, r)
+    z, r, potential_energy, kinetic_energy, z_grad = verlet_state
+    energy_current = potential_energy + kinetic_energy
     latent_size = jnp.size(ravel_pytree(r)[0])
     r_ckpts = jnp.zeros((max_tree_depth, latent_size))
     r_sum_ckpts = jnp.zeros((max_tree_depth, latent_size))
@@ -1134,11 +1219,14 @@ def build_tree(
         z,
         r,
         z_grad,
+        kinetic_energy,
         z,
         r,
         z_grad,
+        kinetic_energy,
         z,
         potential_energy,
+        kinetic_energy,
         z_grad,
         energy_current,
         depth=0,

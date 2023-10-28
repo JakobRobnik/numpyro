@@ -29,7 +29,7 @@ HMCState = namedtuple(
         "z",
         "z_grad",
         "potential_energy",
-        "energy",
+        "kinetic_energy",
         "r",
         "trajectory_length",
         "num_steps",
@@ -82,17 +82,21 @@ def _get_num_steps(step_size, trajectory_length):
     return num_steps.astype(jnp.result_type(int))
 
 
-def momentum_generator(prototype_r, mass_matrix_sqrt, rng_key):
+def momentum_generator(prototype_r, mass_matrix_sqrt, rng_key, mchmc):
     if isinstance(mass_matrix_sqrt, dict):
         rng_keys = random.split(rng_key, len(mass_matrix_sqrt))
         r = {}
         for (site_names, mm_sqrt), rng_key in zip(mass_matrix_sqrt.items(), rng_keys):
             r_block = OrderedDict([(k, prototype_r[k]) for k in site_names])
-            r.update(momentum_generator(r_block, mm_sqrt, rng_key))
+            r.update(momentum_generator(r_block, mm_sqrt, rng_key, mchmc))
         return r
 
     _, unpack_fn = ravel_pytree(prototype_r)
     eps = random.normal(rng_key, jnp.shape(mass_matrix_sqrt)[:1])
+
+    if mchmc:
+        return unpack_fn(eps / jnp.sqrt(jnp.sum(jnp.square(eps))))
+    
     if mass_matrix_sqrt.ndim == 1:
         r = jnp.multiply(mass_matrix_sqrt, eps)
         return unpack_fn(r)
@@ -101,9 +105,9 @@ def momentum_generator(prototype_r, mass_matrix_sqrt, rng_key):
         return unpack_fn(r)
     else:
         raise ValueError("Mass matrix has incorrect number of dims.")
+    
 
-
-def hmc(potential_fn=None, potential_fn_gen=None, kinetic_fn=None, algo="NUTS"):
+def hmc(potential_fn=None, potential_fn_gen=None, kinetic_fn=None, algo="NUTS", mchmc = False):
     r"""
     Hamiltonian Monte Carlo inference, using either fixed number of
     steps or the No U-Turn Sampler (NUTS) with adaptive path length.
@@ -173,6 +177,7 @@ def hmc(potential_fn=None, potential_fn_gen=None, kinetic_fn=None, algo="NUTS"):
     """
     if kinetic_fn is None:
         kinetic_fn = euclidean_kinetic_energy
+    
     vv_update = None
     max_treedepth = None
     wa_update = None
@@ -181,7 +186,7 @@ def hmc(potential_fn=None, potential_fn_gen=None, kinetic_fn=None, algo="NUTS"):
     max_delta_energy = 1000.0
     fixed_num_steps = None
     if algo not in {"HMC", "NUTS"}:
-        raise ValueError("`algo` must be one of `HMC` or `NUTS`.")
+        raise ValueError("`algo` must be one of `HMC` or `NUTS`")
 
     def init_kernel(
         init_params,
@@ -313,23 +318,21 @@ def hmc(potential_fn=None, potential_fn_gen=None, kinetic_fn=None, algo="NUTS"):
         )
 
         rng_key_hmc, rng_key_wa, rng_key_momentum = random.split(rng_key, 3)
-        z_info = IntegratorState(z=z, potential_energy=pe, z_grad=z_grad)
+        z_info = IntegratorState(z=z, potential_energy=pe, kinetic_energy= 0., z_grad=z_grad) # WARNING
         wa_state = wa_init(
             z_info, rng_key_wa, step_size, inverse_mass_matrix=inverse_mass_matrix
         )
-        r = momentum_generator(z, wa_state.mass_matrix_sqrt, rng_key_momentum)
-        vv_init, vv_update = velocity_verlet(pe_fn, kinetic_fn, forward_mode_ad)
+        r = momentum_generator(z, wa_state.mass_matrix_sqrt, rng_key_momentum, mchmc)
+        vv_init, vv_update = velocity_verlet(pe_fn, kinetic_fn, mchmc, forward_mode_ad)
         vv_state = vv_init(z, r, potential_energy=pe, z_grad=z_grad)
-        energy = vv_state.potential_energy + kinetic_fn(
-            wa_state.inverse_mass_matrix, vv_state.r
-        )
+    
         zero_int = jnp.array(0, dtype=jnp.result_type(int))
         hmc_state = HMCState(
             zero_int,
             vv_state.z,
             vv_state.z_grad,
             vv_state.potential_energy,
-            energy,
+            vv_state.kinetic_energy,
             None,
             trajectory_length,
             zero_int,
@@ -353,7 +356,7 @@ def hmc(potential_fn=None, potential_fn_gen=None, kinetic_fn=None, algo="NUTS"):
         if potential_fn_gen:
             nonlocal vv_update, forward_mode_ad
             pe_fn = potential_fn_gen(*model_args, **model_kwargs)
-            _, vv_update = velocity_verlet(pe_fn, kinetic_fn, forward_mode_ad)
+            _, vv_update = velocity_verlet(pe_fn, kinetic_fn, mchmc, forward_mode_ad)
 
         if fixed_num_steps is not None:
             num_steps = fixed_num_steps
@@ -370,25 +373,14 @@ def hmc(potential_fn=None, potential_fn_gen=None, kinetic_fn=None, algo="NUTS"):
             lambda i, val: vv_update(step_size, inverse_mass_matrix, val),
             vv_state,
         )
-        energy_old = vv_state.potential_energy + kinetic_fn(
-            inverse_mass_matrix, vv_state.r
-        )
-        energy_new = vv_state_new.potential_energy + kinetic_fn(
-            inverse_mass_matrix, vv_state_new.r
-        )
-        delta_energy = energy_new - energy_old
+        delta_energy =  vv_state_new.kinetic_energy - vv_state.kinetic_energy + vv_state_new.potential_energy - vv_state.potential_energy
         delta_energy = jnp.where(jnp.isnan(delta_energy), jnp.inf, delta_energy)
         accept_prob = jnp.clip(jnp.exp(-delta_energy), a_max=1.0)
         diverging = delta_energy > max_delta_energy
         transition = random.bernoulli(rng_key, accept_prob)
-        vv_state, energy = cond(
-            transition,
-            (vv_state_new, energy_new),
-            identity,
-            (vv_state, energy_old),
-            identity,
-        )
-        return vv_state, energy, num_steps, accept_prob, diverging
+        
+        vv_state = cond(transition, vv_state_new, identity, vv_state, identity)
+        return vv_state, num_steps, accept_prob, diverging
 
     def _nuts_next(
         step_size,
@@ -402,7 +394,7 @@ def hmc(potential_fn=None, potential_fn_gen=None, kinetic_fn=None, algo="NUTS"):
         if potential_fn_gen:
             nonlocal vv_update, forward_mode_ad
             pe_fn = potential_fn_gen(*model_args, **model_kwargs)
-            _, vv_update = velocity_verlet(pe_fn, kinetic_fn, forward_mode_ad)
+            _, vv_update = velocity_verlet(pe_fn, kinetic_fn, mchmc, forward_mode_ad)
 
         binary_tree = build_tree(
             vv_update,
@@ -420,18 +412,22 @@ def hmc(potential_fn=None, potential_fn_gen=None, kinetic_fn=None, algo="NUTS"):
             z=binary_tree.z_proposal,
             r=vv_state.r,
             potential_energy=binary_tree.z_proposal_pe,
+            kinetic_energy=binary_tree.z_proposal_ke,
             z_grad=binary_tree.z_proposal_grad,
         )
         return (
             vv_state,
-            binary_tree.z_proposal_energy,
             num_steps,
             accept_prob,
             binary_tree.diverging,
         )
-
-    _next = _nuts_next if algo == "NUTS" else _hmc_next
-
+    
+    if algo == "NUTS":
+        _next = _nuts_next
+    elif algo == "HMC":
+        _next = _hmc_next
+        
+        
     def sample_kernel(hmc_state, model_args=(), model_kwargs=None):
         """
         Given an existing :data:`~numpyro.infer.mcmc.HMCState`, run HMC with fixed (possibly adapted)
@@ -450,13 +446,13 @@ def hmc(potential_fn=None, potential_fn_gen=None, kinetic_fn=None, algo="NUTS"):
         )
         r = (
             momentum_generator(
-                hmc_state.z, hmc_state.adapt_state.mass_matrix_sqrt, rng_key_momentum
+                hmc_state.z, hmc_state.adapt_state.mass_matrix_sqrt, rng_key_momentum, mchmc
             )
             if hmc_state.r is None
             else hmc_state.r
         )
         vv_state = IntegratorState(
-            hmc_state.z, r, hmc_state.potential_energy, hmc_state.z_grad
+            hmc_state.z, r, hmc_state.potential_energy, kinetic_fn(hmc_state.adapt_state.inverse_mass_matrix, r), hmc_state.z_grad
         )
         if algo == "HMC":
             hmc_length_args = (hmc_state.trajectory_length,)
@@ -464,7 +460,7 @@ def hmc(potential_fn=None, potential_fn_gen=None, kinetic_fn=None, algo="NUTS"):
             hmc_length_args = (
                 jnp.where(hmc_state.i < wa_steps, max_treedepth[0], max_treedepth[1]),
             )
-        vv_state, energy, num_steps, accept_prob, diverging = _next(
+        vv_state, num_steps, accept_prob, diverging = _next(
             hmc_state.adapt_state.step_size,
             hmc_state.adapt_state.inverse_mass_matrix,
             vv_state,
@@ -494,7 +490,7 @@ def hmc(potential_fn=None, potential_fn_gen=None, kinetic_fn=None, algo="NUTS"):
             vv_state.z,
             vv_state.z_grad,
             vv_state.potential_energy,
-            energy,
+            vv_state.kinetic_energy,
             r,
             hmc_state.trajectory_length,
             num_steps,
@@ -615,7 +611,13 @@ class HMC(MCMCKernel):
         find_heuristic_step_size=False,
         forward_mode_differentiation=False,
         regularize_mass_matrix=True,
+        mchmc = False
     ):
+        if mchmc:
+            if find_heuristic_step_size:
+                raise ValueError('Not implemented yet.')
+        self.mchmc = mchmc
+        
         if not (model is None) ^ (potential_fn is None):
             raise ValueError("Only one of `model` or `potential_fn` must be specified.")
         self._model = model
@@ -670,6 +672,7 @@ class HMC(MCMCKernel):
                     potential_fn_gen=potential_fn,
                     kinetic_fn=self._kinetic_fn,
                     algo=self._algo,
+                    mchmc= self.mchmc
                 )
             self._potential_fn_gen = potential_fn
             self._postprocess_fn = postprocess_fn
@@ -678,6 +681,7 @@ class HMC(MCMCKernel):
                 potential_fn=self._potential_fn,
                 kinetic_fn=self._kinetic_fn,
                 algo=self._algo,
+                mchmc= self.mchmc
             )
 
         return init_params
@@ -889,6 +893,7 @@ class NUTS(HMC):
         find_heuristic_step_size=False,
         forward_mode_differentiation=False,
         regularize_mass_matrix=True,
+        mchmc = False
     ):
         super(NUTS, self).__init__(
             potential_fn=potential_fn,
@@ -905,6 +910,7 @@ class NUTS(HMC):
             find_heuristic_step_size=find_heuristic_step_size,
             forward_mode_differentiation=forward_mode_differentiation,
             regularize_mass_matrix=regularize_mass_matrix,
+            mchmc = mchmc
         )
         self._max_tree_depth = max_tree_depth
         self._algo = "NUTS"
