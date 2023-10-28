@@ -1,26 +1,56 @@
-from tst import run
-from benchmarks import *
-
+import jax
+import jax.numpy as jnp
+import numpyro
+import numpyro.distributions as dist
+from numpyro.infer import HMC, NUTS, MCMC
 import matplotlib.pyplot as plt
-import numpy as np
 plt.style.use(['seaborn-v0_8-talk'])
 
 
-# example usage
+# random number generator key
+key = jax.random.PRNGKey(42)
+key_data1, key_data2, key_warmup, key_sampling = jax.random.split(key, 4)
 
-Target = Funnel()
+
+# setup the taget distribution, we will use Funnel with data    
+d = 20
+sigma = 1.
+
+# true value of the parameters
+def neal_prior(key):
+    key1, key2 = jax.random.split(key)
+    theta = numpyro.sample("theta", dist.Normal(0, 3), rng_key=key1)
+    z = numpyro.sample("z", dist.Normal(jnp.zeros(d - 1), jnp.exp(0.5 * theta)), rng_key= key2)
+    return {'theta': theta, 'z': z}
+        
+truth = neal_prior(key_data1)
+
+# observed values of the parameters
+data = numpyro.sample("zobs", dist.Normal(truth['z'], sigma * jnp.ones(d-1)), rng_key= key_data2)
+        
+# Bayesian model
+def target():
+    theta = numpyro.sample("theta", dist.Normal(0, 3))
+    z = numpyro.sample("z", dist.Normal(jnp.zeros(d - 1), jnp.exp(0.5 * theta)) )
+    numpyro.sample("zobs", dist.Normal(z, sigma), obs = data)
+
+
+# run MCHMC and HMC
 
 for mchmc in [False, True]:
     method = 'MCHMC' if mchmc else 'HMC'
     print('Running ' + method)
-    samples, steps = run(mchmc = mchmc, target= Target.target, prior= Target.prior, 
-                num_warmup = 500, num_samples = 10000, num_chains = 1, thinning = 1, 
-                progress_bar = True, a= 0.8)
-
+    
+    kernel = NUTS(target, adapt_step_size=True, adapt_mass_matrix= False, dense_mass=False, mchmc= mchmc)
+    sampler = MCMC(kernel, num_warmup = 500, num_samples = 10000, num_chains = 1)
+    sampler.warmup(key_warmup)
+    sampler.run(key_sampling)
+    samples = sampler.get_samples()
+    
     plt.hist(samples['theta'], bins = 40, density= True, alpha= 0.5, color = ['teal' if mchmc else 'black'], label = 'NUTS '+ method)
 
-theta_true = Target.truth['theta']
-plt.plot([theta_true, theta_true], [0., 1.], color = 'tab:red', label = 'true value')
+theta_true = truth['theta']
+plt.plot([theta_true, theta_true], [0., 0.4], color = 'tab:red', label = 'true value')
 
 plt.ylabel('marginal posterior density')
 plt.xlabel(r'$\vartheta$')
