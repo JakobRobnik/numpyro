@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 plt.style.use(['seaborn-v0_8-talk'])
 
 
+
 # random number generator key
 key = jax.random.PRNGKey(42)
 key_data1, key_data2, key_warmup, key_sampling = jax.random.split(key, 4)
@@ -25,7 +26,7 @@ def neal_prior(key):
         
 truth = neal_prior(key_data1)
 
-# observed values of the parameters
+# observed data
 data = numpyro.sample("zobs", dist.Normal(truth['z'], sigma * jnp.ones(d-1)), rng_key= key_data2)
         
 # Bayesian model
@@ -41,6 +42,8 @@ for mchmc in [False, True]:
     method = 'MCHMC' if mchmc else 'HMC'
     print('Running ' + method)
     
+    ### the syntax is the standard syntax from numpyro, ###
+    ### we just add an optional parameter mchmc= True if we want to run MCHMC ###
     kernel = NUTS(target, adapt_step_size=True, adapt_mass_matrix= False, dense_mass=False, mchmc= mchmc)
     sampler = MCMC(kernel, num_warmup = 500, num_samples = 10000, num_chains = 1)
     sampler.warmup(key_warmup)
