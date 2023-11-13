@@ -58,4 +58,6 @@ plt.plot([theta_true, theta_true], [0., 0.4], color = 'tab:red', label = 'true v
 plt.ylabel('marginal posterior density')
 plt.xlabel(r'$\vartheta$')
 plt.legend()
-plt.show()
+plt.savefig('posterior.png')
+plt.close()
+#plt.show()
