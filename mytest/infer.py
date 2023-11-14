@@ -25,7 +25,7 @@ def mcmc(mchmc, target, prior,
     if L == None:
         kernel = NUTS(target, adapt_step_size=True, adapt_mass_matrix= False, dense_mass=False, mchmc= mchmc, target_accept_prob= a)
     else:
-        kernel = HMC(target, num_steps = L, adapt_step_size= False, adapt_mass_matrix= False, dense_mass=False, mchmc= mchmc, target_accept_prob= a, step_size= 0.4)
+        kernel = HMC(target, num_steps = L, adapt_step_size= True, adapt_mass_matrix= False, dense_mass=False, mchmc= mchmc, target_accept_prob= a, trajectory_length= None)
         
     sampler = MCMC(kernel, num_warmup= num_warmup, num_samples= num_samples, num_chains= num_chains, thinning= thinning, progress_bar= progress_bar)
 
@@ -38,5 +38,4 @@ def mcmc(mchmc, target, prior,
     sampler.run(key_sampling, extra_fields=['num_steps'])
     
     steps = jnp.array(sampler.get_extra_fields(group_by_chain= True)['num_steps'], dtype=int)
-
     return sampler.get_samples(group_by_chain= True), steps

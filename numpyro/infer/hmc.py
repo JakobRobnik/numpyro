@@ -274,10 +274,7 @@ def hmc(potential_fn=None, potential_fn_gen=None, kinetic_fn=None, algo="NUTS", 
         """
         rng_key = random.PRNGKey(0) if rng_key is None else rng_key
         step_size = lax.convert_element_type(step_size, jnp.result_type(float))
-        if trajectory_length is not None:
-            trajectory_length = lax.convert_element_type(
-                trajectory_length, jnp.result_type(float)
-            )
+  
         nonlocal wa_update, max_treedepth, vv_update, wa_steps, forward_mode_ad, fixed_num_steps
         forward_mode_ad = forward_mode_differentiation
         wa_steps = num_warmup
@@ -358,15 +355,7 @@ def hmc(potential_fn=None, potential_fn_gen=None, kinetic_fn=None, algo="NUTS", 
             pe_fn = potential_fn_gen(*model_args, **model_kwargs)
             _, vv_update = velocity_verlet(pe_fn, kinetic_fn, mchmc, forward_mode_ad)
 
-        if fixed_num_steps is not None:
-            num_steps = fixed_num_steps
-        # no need to spend too many steps if the state z has 0 size (i.e. z is empty)
-        elif len(inverse_mass_matrix) == 0:
-            num_steps = 1
-        else:
-            num_steps = _get_num_steps(step_size, trajectory_length)
-        # makes sure trajectory length is constant, rather than step_size * num_steps
-        step_size = trajectory_length / num_steps
+        num_steps = fixed_num_steps
         vv_state_new = fori_loop(
             0,
             num_steps,
